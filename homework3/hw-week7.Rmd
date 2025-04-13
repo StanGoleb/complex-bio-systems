@@ -1,0 +1,201 @@
+```{r setup, include=FALSE}
+all_times <- list()  # store the time for each chunk
+knitr::knit_hooks$set(time_it = local({
+  now <- NULL
+  function(before, options) {
+    if (before) {
+      now <<- Sys.time()
+    } else {
+      res <- difftime(Sys.time(), now, units = "secs")
+      all_times[[options$label]] <<- res
+    }
+  }
+}))
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  message = FALSE,
+  warning = FALSE,
+  time_it = TRUE
+)
+```
+
+# Setup the Seurat Object
+
+```{r init}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+
+# Load the PBMC dataset
+pbmc.data <- Read10X(data.dir = "/home/lambi/Desktop/studia/ModZlo/lab7/fresh68/hg19/")
+# Initialize the Seurat object with the raw (non-normalized data).
+pbmc <- CreateSeuratObject(counts = pbmc.data, project = "pbmc68k", min.cells = 3, min.features = 200)
+pbmc
+```
+```{r}
+#shrink the dataset - ram problems
+set.seed(42)
+cells_20k <- sample(colnames(pbmc), size = 20000)
+pbmc <- subset(pbmc, cells = cells_20k)
+```
+
+# QC and selecting cells for further analysis
+
+```{r mito, fig.height=7, fig.width=13}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(pbmc, pattern = "^MT-")
+```
+
+```{r qc2, fig.height=7, fig.width=13}
+
+#Visualize QC metrics as a violin plot
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+plot1 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") 
+plot2 <- FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") 
+plot1 + plot2
+
+# percentile cut-off
+max_features <- quantile(pbmc$nFeature_RNA, 0.99)
+max_counts <- quantile(pbmc$nCount_RNA, 0.99)
+
+pbmc <- subset(pbmc,
+               subset = nFeature_RNA > 200 &
+                        nFeature_RNA < max_features &
+                        nCount_RNA < max_counts &
+                        percent.mt < 5)
+```
+
+# Normalizing the data
+
+```{r normalize}
+pbmc <- NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 1e4)
+```
+
+# Identification of highly variable features (feature selection)
+
+```{r var_features, fig.height=5, fig.width=11}
+pbmc <- FindVariableFeatures(pbmc, selection.method = 'vst', nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+# Scaling the data
+
+```{r regressvar, fig.height=7, fig.width=11, results='hide'}
+pbmc <- ScaleData(pbmc)
+```
+
+# Perform linear dimensional reduction
+
+```{r pca,results='hide'}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc), npcs = 30)
+```
+
+```{r pca_viz, message=TRUE}
+# Examine and visualize PCA results a few different ways
+print(pbmc[['pca']], dims = 1:5, nfeatures = 5)
+VizDimLoadings(pbmc, dims = 1:2, reduction = 'pca')
+DimPlot(pbmc, reduction = 'pca')
+```
+
+```{r single-heatmap}
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+```
+
+```{r multi-heatmap, fig.height=15, fig.width=9}
+DimHeatmap(pbmc, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+# Determine the 'dimensionality' of the dataset
+
+```{r jackstraw, fig.height=6, fig.width=10}
+pbmc <- JackStraw(pbmc, num.replicate = 50)
+pbmc <- ScoreJackStraw(pbmc, dims = 1:15) #thresolding
+```
+
+```{r jsplots, fig.height=6, fig.width=10}
+JackStrawPlot(pbmc, dims = 1:15)
+```
+
+```{r elbow_plot, fig.height=6, fig.width=10}
+ElbowPlot(pbmc)
+```
+
+# Cluster the cells
+
+```{r cluster, fig.height=5, fig.width=7}
+pca.embeddings <- Embeddings(pbmc, "pca")[, 1:15]
+kmeans.result <- kmeans(pca.embeddings, centers = 10)
+pbmc$kmeans_clusters <- as.factor(kmeans.result$cluster)
+```
+
+# Run non-linear dimensional reduction (UMAP/tSNE)
+
+```{r tsne, fig.height=5, fig.width=7}
+pbmc <- RunUMAP(pbmc, dims = 1:15)
+```
+
+```{r tsneplot, fig.height=5, fig.width=7}
+# note that you can set `label = TRUE` or use the LabelClusters function to help label individual clusters
+DimPlot(pbmc, reduction = 'umap')
+```
+
+# Homework Problem 2
+```{r}
+subpopulation_labels <- rep(NA, ncol(pbmc))
+names(subpopulation_labels) <- colnames(pbmc)
+
+for (cluster_id in unique(pbmc$kmeans_clusters)) {
+  cluster_cells <- WhichCells(pbmc, expression = kmeans_clusters == cluster_id)
+  pca_data <- Embeddings(pbmc, "pca")[cluster_cells, 1:10]
+
+  sil_widths <- sapply(2:6, function(k){
+    km <- kmeans(pca_data, centers = k, nstart = 10)
+    sil <- cluster::silhouette(km$cluster, dist(pca_data))
+    mean(sil[, 3])
+  })
+
+  optimal_k <- which.max(sil_widths) + 1
+  km <- kmeans(pca_data, centers = optimal_k, nstart = 20)
+
+  cluster_labels <- paste0("Cluster", cluster_id, "_Sub", km$cluster)
+  names(cluster_labels) <- cluster_cells
+  subpopulation_labels[cluster_cells] <- cluster_labels
+}
+
+pbmc$subpopulation <- subpopulation_labels
+```
+
+```{r}
+library(ggplot2)
+tsne_coords <- as.data.frame(Embeddings(pbmc, reduction = "umap"))
+colnames(tsne_coords) <- c("UMAP_1", "UMAP_2")
+
+tsne_coords$cluster <- pbmc$kmeans_clusters
+tsne_coords$subpopulation <- pbmc$subpopulation
+
+centers <- tsne_coords %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(x = median(UMAP_1),
+                   y = median(UMAP_2))
+
+ggplot(tsne_coords, aes(x = UMAP_1, y = UMAP_2, color = subpopulation)) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  geom_text(data = centers, aes(x = x, y = y, label = cluster),
+            color = "black", size = 5, fontface = "bold") +
+  theme_classic() +
+  labs(title = "t-SNE with subpopulations", x = "UMAP 1", y = "UMAP 2")
+
+```
+
+```{r}
+DimPlot(pbmc, reduction = 'umap', split.by = 'kmeans_clusters', group.by = 'subpopulation', ncol = 3)
+
+```
